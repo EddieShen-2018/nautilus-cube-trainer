@@ -32,7 +32,7 @@ body { padding-bottom: calc(60px + var(--safe-bottom)); }
 .header { background: var(--primary); padding: 12px 16px; border-bottom: 3px solid var(--accent); position: sticky; top: 0; z-index: 100; }
 .header h1 { font-size: 18px; color: #fff; }
 .header p { font-size: 11px; color: #c8d6e5; margin-top: 2px; }
-
+    
 /* 控制栏 */
 .controls { background: var(--card); padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
 .control-group { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 120px; }
@@ -628,6 +628,7 @@ body { padding-bottom: calc(60px + var(--safe-bottom)); }
                     <button class="btn btn-secondary" id="nextBtn" onclick="nextPractice()">Next</button>
                     <button class="btn btn-gray" id="showHintBtn" onclick="showHint()" disabled>Hint</button>
                     <button class="btn btn-gray" id="showStepsBtn" onclick="showSteps()" disabled>Steps</button>
+                    <button class="btn btn-gray" id="animBtn" onclick="playPracticeAnimation()" disabled>Anim</button>
                 </div>
                 <div class="practice-card setting-card">
                     <h3>Setting</h3>
@@ -1031,6 +1032,8 @@ function setViewMode(mode) {
 }
 function rerenderAll() {
     if (window.currentGroupStates) renderGroupResults();
+    // 动画播放/暂停中：practiceCanvas 由动画帧接管，跳过静态重渲染避免闪烁
+    if (animPlaying || animPaused) return;
     if (window.practiceState) renderCube(document.getElementById("practiceCanvas"), window.practiceState, window.practiceArrows);
 }
 
@@ -1775,9 +1778,14 @@ function inverseUStarMove(move) {
 
 // ====== Random practice ======
 function resetPractice() {
+    stopPracticeAnimation();  // 复位练习时停止进行中的动画
     practiceCurrent = null;
     window.practiceState = null;
     window.practiceArrows = null;
+    window.practiceInitState = null;
+    window.practiceInitArrows = null;
+    window.practiceStepsHtml = null;
+    window.practiceUstarPrefixTokens = null;
     document.getElementById("practiceInfo").innerHTML = currentSet ? `
         <div class="practice-empty">
             <div>Click "Next" to start practice</div>
@@ -1787,6 +1795,7 @@ function resetPractice() {
         </div>`;
     document.getElementById("showHintBtn").disabled = true;
     document.getElementById("showStepsBtn").disabled = true;
+    document.getElementById("animBtn").disabled = true;
     let canvas = document.getElementById("practiceCanvas");
     let ctx = canvas.getContext("2d");
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -1801,6 +1810,7 @@ function nextPractice() {
 }
 
 function showPracticeFormula(f) {
+    stopPracticeAnimation();  // 换案例时停止进行中的动画
     practiceCurrent = f;
     let stateData = FORMULA_DATA[currentSet].states[f.state_file];
     if (!stateData) {
@@ -1826,6 +1836,9 @@ function showPracticeFormula(f) {
     }
     window.practiceState = state;
     window.practiceArrows = arrows;
+    // 动画重播快照：初始状态/箭头（U* 应用后），播放结束/中途停止时据此复位
+    window.practiceInitState = state.slice();
+    window.practiceInitArrows = arrows.map(a => ({ from: a.from.slice(), to: a.to.slice() }));
     renderCube(document.getElementById("practiceCanvas"), state, arrows);
 
     // U* 开启且应用了旋转时，公式前加括号反向 U 转动（如旋转 U → 前缀 "(U') "）
@@ -1838,8 +1851,12 @@ function showPracticeFormula(f) {
         <div class="practice-tags">${tagsHtml}</div>
         <div class="hint-box" id="hintBox">${f.hint || "(No hint)"}</div>
         <div class="steps-box" id="stepsBox">${formatSteps(f.steps, ustarPrefix)}</div>`;
+    // 动画用：stepsBox 原文快照 + U* 前缀反向转动 token（播放时先转前缀再转公式）
+    window.practiceStepsHtml = document.getElementById("stepsBox").innerHTML;
+    window.practiceUstarPrefixTokens = ustarInv ? [ustarInv] : [];
     document.getElementById("showHintBtn").disabled = false;
     document.getElementById("showStepsBtn").disabled = false;
+    document.getElementById("animBtn").disabled = false;
 }
 
 function showHint() {
@@ -1850,6 +1867,330 @@ function showSteps() {
     let box = document.getElementById("stepsBox");
     if (box) box.classList.add("visible");
 }
+
+// ====== 3D 动画（点击可运行的 3D 动图）======
+// 旋转几何表（与 hist/_check_geo.py 逐置换验证一致，45 个转动 ALL OK）：
+//   axis：旋转轴；layers：旋转层内块中心的轴坐标集合；sign：顺时针 90° 的旋转角符号
+//   旋转角 = sign × quarter × π/2（quarter：1=顺，2=180°，-1=逆），右手定则绕 (1.5,1.5,1.5)
+const ANIM_GEO = {
+    "U": { axis: "z", layers: [2.5], sign: -1 },  "D": { axis: "z", layers: [0.5], sign: 1 },
+    "F": { axis: "y", layers: [0.5], sign: 1 },   "B": { axis: "y", layers: [2.5], sign: -1 },
+    "L": { axis: "x", layers: [0.5], sign: 1 },   "R": { axis: "x", layers: [2.5], sign: -1 },
+    "M": { axis: "x", layers: [1.5], sign: 1 },   "E": { axis: "z", layers: [1.5], sign: 1 },
+    "S": { axis: "y", layers: [1.5], sign: 1 },
+    "u": { axis: "z", layers: [2.5, 1.5], sign: -1 }, "d": { axis: "z", layers: [0.5, 1.5], sign: 1 },
+    "l": { axis: "x", layers: [0.5, 1.5], sign: 1 },  "r": { axis: "x", layers: [2.5, 1.5], sign: -1 },
+    "f": { axis: "y", layers: [0.5, 1.5], sign: 1 },  "b": { axis: "y", layers: [2.5, 1.5], sign: -1 },
+};
+// 绕魔方中心 (1.5,1.5,1.5) 的右手定则旋转（与 Python 验证脚本 rotate_point 一致）
+function rotatePointAnim(p, axis, angle) {
+    let x = p[0] - 1.5, y = p[1] - 1.5, z = p[2] - 1.5;
+    let c = Math.cos(angle), s = Math.sin(angle);
+    if (axis === "x") return [x + 1.5, (y * c - z * s) + 1.5, (y * s + z * c) + 1.5];
+    if (axis === "y") return [(x * c + z * s) + 1.5, y + 1.5, (-x * s + z * c) + 1.5];
+    return [(x * c - y * s) + 1.5, (x * s + y * c) + 1.5, z + 1.5];
+}
+// 相机方向（自魔方中心指向相机，原坐标系）：用于判定贴纸朝向（近侧/远侧）
+// 推导：project3D 的深度轴 y2 增大 = 远离相机；朝相机方向 = 经 R_z(angleY)·R_x(angleX) 映射到 (0,-1,0) 的向量
+function animCamDir(angleX, angleY) {
+    return [Math.cos(angleX) * Math.sin(-angleY), -Math.cos(angleX) * Math.cos(angleY), Math.sin(angleX)];
+}
+// 方向向量纯旋转（无中心平移）；旋转公式与 rotatePointAnim 一致（标准右手定则）
+function rotateVecAnim(v, axis, angle) {
+    let c = Math.cos(angle), s = Math.sin(angle);
+    let x = v[0], y = v[1], z = v[2];
+    if (axis === "x") return [x, y * c - z * s, y * s + z * c];
+    if (axis === "y") return [x * c + z * s, y, -x * s + z * c];
+    return [x * c - y * s, x * s + y * c, z];
+}
+const FACE_NORMALS = { "U": [0,0,1], "D": [0,0,-1], "F": [0,-1,0], "B": [0,1,0], "L": [-1,0,0], "R": [1,0,0] };
+// 动画帧渲染：透视（X-ray）风格——全部 54 贴纸画在真实 3D 位置（无投影墙、无背面剔除），
+// 从当前视角可透过近侧看到 L/D/B 面贴纸：
+//   1. 静止贴纸：真实位置（faceletQuad）
+//   2. 旋转贴纸：绕轴旋转后的真实位置与法线
+//   透明度按贴纸当前法线与相机方向动态判定：朝向相机（近侧 U/F/R）不透明，背向相机（远侧 L/D/B）半透明
+function renderCube3DAnim(canvas, state, moveBase, angle) {
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+    const angleX = 25 * Math.PI / 180;
+    const angleY = -50 * Math.PI / 180;
+    const scale = Math.min(W, H) / 6;
+    const cx = W / 2, cy = H / 2;
+    const geo = ANIM_GEO[moveBase];
+    if (!geo) return;
+    const axisIdx = geo.axis === "x" ? 0 : (geo.axis === "y" ? 1 : 2);
+    const camDir = animCamDir(angleX, angleY);
+    let polys = [];
+    for (let face of FACE_ORDER) {
+        let start = FACE_START[face];
+        for (let idx = 0; idx < 9; idx++) {
+            let row = Math.floor(idx / 3), col = idx % 3;
+            let gIdx = start + idx;
+            let color = COLOR_RGB[state[gIdx]] || COLOR_RGB["-"];
+            let center = blockCenter3D(gIdx);
+            let rotating = !!center && geo.layers.indexOf(center[axisIdx]) !== -1;
+            let quad, n;
+            if (rotating) {
+                // 旋转贴纸：绕轴旋转后的真实位置与法线
+                quad = faceletQuad(face, row, col).map(v => rotatePointAnim(v, geo.axis, angle));
+                n = rotateVecAnim(FACE_NORMALS[face], geo.axis, angle);
+            } else {
+                quad = faceletQuad(face, row, col);
+                n = FACE_NORMALS[face];
+            }
+            // 朝向相机（近侧 U/F/R）不透明；背向相机（远侧 L/D/B）半透明可透视
+            let facing = n[0] * camDir[0] + n[1] * camDir[1] + n[2] * camDir[2] > 0;
+            polys.push({ quad: quad, color: color, alpha: facing ? 1.0 : 0.45 });
+        }
+    }
+    // 固定包围盒：按全部 54 张静止贴纸的真实位置计算（不含旋转）→ 构图稳定全程无抖动
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (let face of FACE_ORDER) {
+        for (let idx = 0; idx < 9; idx++) {
+            let row = Math.floor(idx / 3), col = idx % 3;
+            let quad = faceletQuad(face, row, col);
+            for (let v of quad) {
+                let pv = project3D(v, angleX, angleY);
+                if (pv[0] < minX) minX = pv[0];
+                if (pv[0] > maxX) maxX = pv[0];
+                if (pv[2] < minZ) minZ = pv[2];
+                if (pv[2] > maxZ) maxZ = pv[2];
+            }
+        }
+    }
+    const offX = (minX + maxX) / 2;
+    const offZ = (minZ + maxZ) / 2;
+    for (let p of polys) {
+        p.proj = p.quad.map(v => {
+            let pv = project3D(v, angleX, angleY);
+            return [cx + (pv[0] - offX) * scale, cy - (pv[2] - offZ) * scale, pv[1]];
+        });
+        p.depth = p.proj.reduce((s, v) => s + v[2], 0) / 4;
+    }
+    // 深度 y2 降序 = 远者先画；远侧半透明贴纸先画、近侧不透明贴纸后画叠加 → 近侧清晰、远侧 L/D/B 半透明可见
+    polys.sort((a, b) => b.depth - a.depth);
+    for (let p of polys) {
+        ctx.beginPath();
+        ctx.moveTo(p.proj[0][0], p.proj[0][1]);
+        for (let i = 1; i < p.proj.length; i++) ctx.lineTo(p.proj[i][0], p.proj[i][1]);
+        ctx.closePath();
+        ctx.globalAlpha = p.alpha;
+        ctx.fillStyle = p.color;
+        ctx.fill();
+        ctx.globalAlpha = 1.0;
+        ctx.strokeStyle = "#000";
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
+    }
+}
+
+// ====== 公式 token 解析 ======
+// 支持：括号组（含幂次，如 (RUR'U')3）、move token（R / R' / R2 / R'2 / R2'）
+// 返回 [{base, power}]；power：1=顺，2=180°，3=逆
+function parseAnimTokens(steps) {
+    function parseSeq(s) {
+        let out = [];
+        let i = 0;
+        while (i < s.length) {
+            let c = s[i];
+            if (c === " " || c === "\t" || c === "\n") { i++; continue; }
+            if (c === "(") {
+                let depth = 1, j = i + 1;
+                while (j < s.length && depth > 0) {
+                    if (s[j] === "(") depth++;
+                    else if (s[j] === ")") depth--;
+                    j++;
+                }
+                if (depth !== 0) return out;  // 括号不闭合：放弃剩余部分
+                let inner = parseSeq(s.slice(i + 1, j - 1));
+                let k = j;
+                while (k < s.length && s[k] === " ") k++;
+                let num = "";
+                while (k < s.length && s[k] >= "0" && s[k] <= "9") { num += s[k]; k++; }
+                let times = num ? parseInt(num, 10) : 1;
+                for (let t = 0; t < times; t++) out = out.concat(inner);
+                i = k;
+                continue;
+            }
+            let m = /^[A-Za-z](?:'2|2'|'2'|2|')?/.exec(s.slice(i));
+            if (!m) { i++; continue; }  // 未知字符跳过
+            let tok = m[0];
+            i += tok.length;
+            let suffix = tok.slice(1);
+            let power = 1;
+            if (suffix === "2" || suffix === "'2" || suffix === "2'") power = 2;
+            else if (suffix === "'") power = 3;
+            out.push({ base: tok[0], power: power });
+        }
+        return out;
+    }
+    return parseSeq(String(steps || ""));
+}
+
+// ====== 动画播放引擎（requestAnimationFrame 逐步转动）======
+// 三态按钮：未开始 → 播放中 → 暂停中 → 继续播放 → …；播放完毕回到未开始
+let animPlaying = false;    // 播放中（帧循环运行）
+let animPaused = false;     // 暂停中（保留进度，可继续）
+let animRafId = 0;
+let animState = null;      // 播放中的当前状态（每步完成后用 MOVES 置换同步）
+let animTokens = [];
+let animStepIdx = 0;
+let animStepT0 = 0;         // 当前步起始时间戳（暂停时冻结，恢复时平移）
+let animStepElapsed = 0;    // 暂停时当前步已播放的时长
+let animInWait = false;     // 正处于步间停顿（advanceAnimStep 的 wait 阶段）
+const ANIM_STEP_MS = 640;    // 90° 转动时长（180° ×1.6）
+const ANIM_PAUSE_MS = 240;   // 步间停顿
+
+function easeInOut(t) {
+    return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+}
+function animMoveName(tok) {
+    return tok.base + (tok.power === 2 ? "2" : (tok.power === 3 ? "'" : ""));
+}
+function setAnimBtnState(playing, paused) {
+    let btn = document.getElementById("animBtn");
+    if (!btn) return;
+    btn.textContent = paused ? "Resume" : (playing ? "Pause" : "Anim");
+    btn.classList.toggle("playing", playing);
+    btn.classList.toggle("paused", !!paused);
+}
+// 播放中把 stepsBox 替换为 token 序列并高亮当前步（已完成的标绿）
+function renderAnimSteps(currentIdx) {
+    let box = document.getElementById("stepsBox");
+    if (!box) return;
+    box.classList.add("visible");
+    box.innerHTML = animTokens.map((tok, i) =>
+        `<span class="anim-step${i === currentIdx ? " current" : ""}${i < currentIdx ? " done" : ""}">${animMoveName(tok)}</span>`
+    ).join(" ");
+}
+// 停止动画并清空进度；restore=true 时恢复初始展示（状态/箭头/stepsBox 原文）
+function stopPracticeAnimation(restore) {
+    if (animRafId) cancelAnimationFrame(animRafId);
+    animRafId = 0;
+    let wasActive = animPlaying || animPaused;
+    animPlaying = false;
+    animPaused = false;
+    animTokens = [];
+    animStepIdx = 0;
+    animStepElapsed = 0;
+    animInWait = false;
+    setAnimBtnState(false, false);
+    if (restore && wasActive && practiceCurrent) {
+        if (window.practiceInitState) {
+            window.practiceState = window.practiceInitState.slice();
+            window.practiceArrows = (window.practiceInitArrows || []).map(a => ({ from: a.from.slice(), to: a.to.slice() }));
+            renderCube(document.getElementById("practiceCanvas"), window.practiceState, window.practiceArrows);
+        }
+        let box = document.getElementById("stepsBox");
+        if (box && window.practiceStepsHtml) box.innerHTML = window.practiceStepsHtml;
+    }
+}
+// 三态切换：未开始→播放；播放中→暂停；暂停中→继续
+function playPracticeAnimation() {
+    if (!practiceCurrent || !window.practiceInitState) return;
+    if (animPlaying) { pausePracticeAnimation(); return; }   // 播放中 → 暂停
+    if (animPaused) { resumePracticeAnimation(); return; }   // 暂停中 → 继续
+    let steps = practiceCurrent.steps;
+    if (Array.isArray(steps)) steps = steps.length > 0 ? steps[0] : "";  // list：多条备选公式，播第一条
+    let tokens = (window.practiceUstarPrefixTokens || []).concat(parseAnimTokens(steps));
+    if (tokens.length === 0) return;
+    animTokens = tokens;
+    animPlaying = true;
+    animPaused = false;
+    animStepIdx = 0;
+    animStepElapsed = 0;
+    animState = window.practiceInitState.slice();
+    window.practiceState = window.practiceInitState.slice();
+    window.practiceArrows = (window.practiceInitArrows || []).map(a => ({ from: a.from.slice(), to: a.to.slice() }));
+    setAnimBtnState(true, false);
+    playAnimStep(performance.now());
+}
+// 暂停：冻结当前步进度（记录已播放时长），取消帧循环
+function pausePracticeAnimation() {
+    if (!animPlaying) return;
+    animStepElapsed = animInWait ? 0 : Math.max(0, performance.now() - animStepT0);
+    if (animRafId) cancelAnimationFrame(animRafId);
+    animRafId = 0;
+    animPlaying = false;
+    animPaused = true;
+    setAnimBtnState(false, true);
+}
+// 继续：从冻结进度恢复当前步（平移 t0 使进度无缝衔接）
+function resumePracticeAnimation() {
+    if (!animPaused) return;
+    animPlaying = true;
+    animPaused = false;
+    setAnimBtnState(true, false);
+    if (animInWait) playAnimStep(performance.now());         // 停顿期暂停：直接开始下一步
+    else playAnimStep(performance.now() - animStepElapsed);  // 步中暂停：无缝续播
+}
+function playAnimStep(t0) {
+    let tok = animTokens[animStepIdx];
+    let moveName = animMoveName(tok);
+    let geo = ANIM_GEO[tok.base];
+    let perm = MOVES[moveName];
+    if (!geo || !perm) { advanceAnimStep(); return; }  // 未知转动（数据集外）：跳过
+    animStepT0 = t0;          // 记录本步起始（含恢复时的平移），供暂停计算进度
+    animStepElapsed = 0;
+    animInWait = false;
+    let duration = ANIM_STEP_MS * (tok.power === 2 ? 1.6 : 1);
+    renderAnimSteps(animStepIdx);
+    function frame(t) {
+        if (!animPlaying) return;
+        let raw = Math.min(1, (t - t0) / duration);
+        let quarter = tok.power === 1 ? 1 : (tok.power === 2 ? 2 : -1);
+        let angle = geo.sign * quarter * (Math.PI / 2) * easeInOut(raw);
+        renderCube3DAnim(document.getElementById("practiceCanvas"), animState, tok.base, angle);
+        if (raw < 1) {
+            animRafId = requestAnimationFrame(frame);
+        } else {
+            // 本步完成：置换同步状态，箭头跟随贴纸移动
+            animState = applyPermToState(animState, perm);
+            window.practiceState = animState.slice();
+            window.practiceArrows = transformArrows(window.practiceArrows || [], inversePerm(perm));
+            advanceAnimStep();
+        }
+    }
+    animRafId = requestAnimationFrame(frame);
+}
+function advanceAnimStep() {
+    animStepIdx++;
+    if (animStepIdx >= animTokens.length) {
+        // 播放完成：最终态渲染（含箭头）+ 恢复 stepsBox 原文
+        animPlaying = false;
+        animPaused = false;
+        animInWait = false;
+        animRafId = 0;
+        animStepElapsed = 0;
+        setAnimBtnState(false, false);
+        renderCube(document.getElementById("practiceCanvas"), window.practiceState, window.practiceArrows);
+        let box = document.getElementById("stepsBox");
+        if (box && window.practiceStepsHtml) box.innerHTML = window.practiceStepsHtml;
+        return;
+    }
+    animInWait = true;
+    let pauseStart = performance.now();
+    function wait(t) {
+        if (!animPlaying) return;
+        if (t - pauseStart < ANIM_PAUSE_MS) { animRafId = requestAnimationFrame(wait); return; }
+        animInWait = false;
+        playAnimStep(t);
+    }
+    animRafId = requestAnimationFrame(wait);
+}
+// 动画样式注入 + 画布点击播放绑定（iOS 兼容：addEventListener 而非 inline）
+(function initAnimUi() {
+    let st = document.createElement("style");
+    st.textContent = ".anim-step{display:inline-block;padding:0 2px;border-radius:3px;color:#888;}" +
+        ".anim-step.done{color:#2e7d32;}" +
+        ".anim-step.current{background:#e74c3c;color:#fff;font-weight:bold;}" +
+        "#animBtn.playing{background:#e74c3c;color:#fff;border-color:#c0392b;}" +
+        "#animBtn.paused{background:#f39c12;color:#fff;border-color:#d68910;}";
+    document.head.appendChild(st);
+    let canvas = document.getElementById("practiceCanvas");
+    if (canvas) canvas.addEventListener("click", function() { if (practiceCurrent) playPracticeAnimation(); });
+})();
 
 // ====== Tab 切换（底部导航）======
 let currentTab = "intro";
